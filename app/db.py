@@ -555,6 +555,42 @@ async def begin_immediate(db: aiosqlite.Connection) -> None:
     await db.execute("BEGIN IMMEDIATE")
 
 
+@asynccontextmanager
+async def read_snapshot() -> AsyncIterator[aiosqlite.Connection]:
+    """One connection pinned to a single read-only SQLite snapshot.
+
+    Strictly read-only trial endpoints (selection plans, cost attributions,
+    repeat-run trials, reversal plans, release forecasts) read the cap, the
+    granted requests, the valid reservations and validate the request-supplied
+    candidates through several SELECTs.  In WAL mode every SELECT *outside* an
+    explicit transaction starts against the latest committed snapshot, so a
+    cap transfer or reversal committing between two of those reads would mix
+    an old cap with new occupancy and produce an unexecutable plan.
+
+    This context opens the connection with ``PRAGMA query_only = ON`` (any
+    accidental write is rejected by SQLite itself) and one deferred
+    ``BEGIN``: in WAL the first read establishes a snapshot that every
+    subsequent read in the transaction shares, while readers neither block
+    writers nor are blocked by them.  Nothing is committed; the transaction
+    is rolled back on exit, so the very next request opens a fresh snapshot
+    and sees whatever committed in the meantime.
+    """
+    conn = aiosqlite.connect(settings.db_path)
+    async with conn as c:
+        c.row_factory = aiosqlite.Row
+        await c.execute(f"PRAGMA busy_timeout = {int(settings.busy_timeout_ms)}")
+        # query_only is a no-write guarantee at the connection level; it only
+        # needs resetting for completeness because the connection is closed
+        # immediately afterwards.
+        await c.execute("PRAGMA query_only = ON")
+        await c.execute("BEGIN")
+        try:
+            yield c
+        finally:
+            await c.rollback()
+            await c.execute("PRAGMA query_only = OFF")
+
+
 # ---------------------------------------------------------------- datasets --
 
 
