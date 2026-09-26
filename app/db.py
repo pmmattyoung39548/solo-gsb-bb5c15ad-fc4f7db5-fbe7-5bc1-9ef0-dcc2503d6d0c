@@ -555,6 +555,32 @@ async def begin_immediate(db: aiosqlite.Connection) -> None:
     await db.execute("BEGIN IMMEDIATE")
 
 
+@asynccontextmanager
+async def read_snapshot() -> AsyncIterator[aiosqlite.Connection]:
+    """Read-only connection whose statements share one committed snapshot.
+
+    A deferred ``BEGIN`` pins the WAL read snapshot at the first statement,
+    so every SELECT issued through this connection observes the same commit
+    state even when other connections commit in between -- one request can
+    never mix, say, a pre-transfer epsilon cap with post-transfer occupancy.
+    The next call opens a fresh snapshot and therefore sees everything
+    committed since.  Only SELECTs are expected: a deferred read transaction
+    never takes a write lock and never blocks or is blocked by writers.
+    """
+    conn = aiosqlite.connect(settings.db_path)
+    async with conn as c:
+        c.row_factory = aiosqlite.Row
+        await c.execute(f"PRAGMA busy_timeout = {int(settings.busy_timeout_ms)}")
+        await c.execute("BEGIN")
+        try:
+            yield c
+        except BaseException:
+            await c.rollback()
+            raise
+        else:
+            await c.commit()
+
+
 # ---------------------------------------------------------------- datasets --
 
 

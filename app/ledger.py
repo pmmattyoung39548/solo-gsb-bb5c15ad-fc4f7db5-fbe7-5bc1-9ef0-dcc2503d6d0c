@@ -1379,6 +1379,13 @@ async def release_forecast(
     composition.  Reservations still valid at the deadline keep counting.
     Nothing is written: in particular the lazy expiry sweep never runs here,
     and the supplied deadline never affects stored reservation state.
+
+    All reads of one call -- the dataset caps, the granted requests and the
+    reservation rows -- come from a single SQLite commit snapshot (one
+    deferred read transaction), and reservation validity is judged against
+    the single UTC instant captured for this call, so a concurrent transfer
+    or reversal committing mid-request cannot mix states into the forecast.
+    The next call opens a fresh snapshot and sees later commits.
     """
     if deadline.tzinfo is None or deadline.utcoffset() is None:
         raise InvalidForecastDeadline(
@@ -1394,7 +1401,7 @@ async def release_forecast(
     now_iso = now.isoformat()
     deadline_iso = deadline.isoformat()
 
-    async with db.connect() as conn:
+    async with db.read_snapshot() as conn:
         dataset = await db.require_dataset(conn, dataset_id)
         # Pure SELECTs only: list_granted_reservation_rows performs no expiry
         # UPDATE, so this forecast cannot mutate the database.
@@ -1402,7 +1409,6 @@ async def release_forecast(
         rows = await db.list_granted_reservation_rows(
             conn, dataset_id, now_iso=now_iso
         )
-        assert not conn.in_transaction
 
     cap = dataset["epsilon_cap"]
     target_delta = dataset["delta_cap"]
@@ -1468,6 +1474,14 @@ async def selection_plan(
     any other record.  Every call therefore recomputes against the latest
     committed ledger state.
 
+    All reads of one call -- the dataset caps, the granted requests and the
+    reservation rows -- come from a single SQLite commit snapshot (one
+    deferred read transaction), and reservation validity is judged against
+    the single UTC instant captured for this call, so a concurrent transfer
+    or reversal committing mid-request cannot mix an old cap with new
+    occupancy into the plan.  The next call opens a fresh snapshot and sees
+    later commits.
+
     Every subset of the 1-12 candidates is enumerated (at most 4096) and each
     feasible subset (projected epsilon <= cap + tolerance) competes by:
 
@@ -1478,7 +1492,7 @@ async def selection_plan(
     now = utcnow()
     now_iso = now.isoformat()
 
-    async with db.connect() as conn:
+    async with db.read_snapshot() as conn:
         dataset = await db.require_dataset(conn, dataset_id)
         # Pure SELECTs only (no lazy expiry UPDATE), so the trial is strictly
         # read-only; reservations past their TTL simply do not qualify.
@@ -1486,7 +1500,6 @@ async def selection_plan(
         reservation_rows = await db.list_granted_reservation_rows(
             conn, dataset_id, now_iso=now_iso
         )
-        assert not conn.in_transaction
 
     cap = dataset["epsilon_cap"]
     target_delta = dataset["delta_cap"]
@@ -1784,12 +1797,19 @@ async def cost_attribution(
     Like the release forecast and selection plan this path issues pure
     SELECTs only: it never sweeps reservation expiry and never writes any
     record, so repeated calls always recompute against the live ledger.
+    All reads of one call -- the dataset caps, the granted requests, the
+    reservation rows and the per-id candidate validation -- come from a
+    single SQLite commit snapshot (one deferred read transaction), and
+    reservation validity is judged against the single UTC instant captured
+    for this call, so a concurrent transfer or reversal committing
+    mid-request cannot mix states into the attribution.  The next call opens
+    a fresh snapshot and sees later commits.
     """
     now = utcnow()
     now_iso = now.isoformat()
     selected_ids = payload.request_ids
 
-    async with db.connect() as conn:
+    async with db.read_snapshot() as conn:
         dataset = await db.require_dataset(conn, dataset_id)
         # Pure SELECTs only (no lazy expiry UPDATE), so the attribution is
         # strictly read-only; reservations past their TTL simply do not
@@ -1804,7 +1824,6 @@ async def cost_attribution(
             await db.get_request(conn, dataset_id, request_id)
             for request_id in selected_ids
         ]
-        assert not conn.in_transaction
 
     # Validate the whole selection against the live ledger.  A missing id is
     # 404; a rejected or already-reversed id is 409, reported in request order.
@@ -1973,12 +1992,18 @@ async def repeat_run_trial(
     Like the release forecast, selection plan and cost attribution, this path
     issues pure SELECTs only: it never sweeps reservation expiry, creates no
     request, reservation, batch, reversal or any other record, and each call
-    recomputes against the latest committed ledger state.
+    recomputes against the latest committed ledger state.  All reads of one
+    call -- the dataset caps, the granted requests and the reservation rows
+    -- come from a single SQLite commit snapshot (one deferred read
+    transaction), and reservation validity is judged against the single UTC
+    instant captured for this call, so a concurrent transfer or reversal
+    committing mid-request cannot mix an old cap with new occupancy into the
+    trial.  The next call opens a fresh snapshot and sees later commits.
     """
     now = utcnow()
     now_iso = now.isoformat()
 
-    async with db.connect() as conn:
+    async with db.read_snapshot() as conn:
         dataset = await db.require_dataset(conn, dataset_id)
         # Pure SELECTs only (no lazy expiry UPDATE), so the trial is strictly
         # read-only; reservations past their TTL simply do not qualify.
@@ -1986,7 +2011,6 @@ async def repeat_run_trial(
         reservation_rows = await db.list_granted_reservation_rows(
             conn, dataset_id, now_iso=now_iso
         )
-        assert not conn.in_transaction
 
     cap = dataset["epsilon_cap"]
     target_delta = dataset["delta_cap"]
@@ -2115,12 +2139,19 @@ async def reversal_plan(
     repeat-run trial this path issues pure SELECTs only: it never sweeps
     reservation expiry, never reverses or submits anything and creates no
     record of any kind, so every call recomputes against the live ledger.
+    All reads of one call -- the dataset caps, the granted requests, the
+    reservation rows and the per-id candidate validation -- come from a
+    single SQLite commit snapshot (one deferred read transaction), and
+    reservation validity is judged against the single UTC instant captured
+    for this call, so a concurrent transfer or reversal committing
+    mid-request cannot mix states into the plan.  The next call opens a
+    fresh snapshot and sees later commits.
     """
     now = utcnow()
     now_iso = now.isoformat()
     selected_ids = payload.request_ids
 
-    async with db.connect() as conn:
+    async with db.read_snapshot() as conn:
         dataset = await db.require_dataset(conn, dataset_id)
         # Pure SELECTs only (no lazy expiry UPDATE), so the trial is strictly
         # read-only; reservations past their TTL simply do not qualify.
@@ -2134,7 +2165,6 @@ async def reversal_plan(
             await db.get_request(conn, dataset_id, request_id)
             for request_id in selected_ids
         ]
-        assert not conn.in_transaction
 
     # Validate the whole candidate set against the live ledger.  A missing id
     # is 404; a rejected or already-reversed id is 409, reported in request
